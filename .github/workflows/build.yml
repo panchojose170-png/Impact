@@ -1,0 +1,118 @@
+name: Compilar mod
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Buscar impact.zip
+        id: zip
+        run: |
+          if [ -f impact.zip ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No hay impact.zip en el repo, no hay nada que compilar." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.zip.outputs.found == 'true'
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.zip.outputs.found == 'true'
+        with:
+          gradle-version: '9.6.0'
+
+      - name: Descomprimir el proyecto
+        if: steps.zip.outputs.found == 'true'
+        run: |
+          mkdir proyecto
+          unzip -q impact.zip -d proyecto
+          if [ ! -f proyecto/build.gradle ]; then
+            d=$(find proyecto -maxdepth 2 -name build.gradle -printf '%h\n' | head -n 1)
+            if [ -n "$d" ]; then mv "$d"/* proyecto/ || true; fi
+          fi
+          ls proyecto
+
+      - name: Buscar versiones de Fabric
+        if: steps.zip.outputs.found == 'true'
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, urllib.request
+
+          def get(url):
+              with urllib.request.urlopen(url, timeout=60) as r:
+                  return r.read().decode()
+
+          MC = "26.3"
+
+          meta = get("https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml")
+          vers = re.findall(r"<version>([^<]+)</version>", meta)
+          mine = [v for v in vers if v.endswith("+" + MC)]
+          if not mine:
+              print("No encontre Fabric API para Minecraft " + MC)
+              print("Ultimas versiones publicadas: " + ", ".join(vers[-12:]))
+              sys.exit(1)
+          fabric_api = mine[-1]
+
+          loader_meta = get("https://maven.fabricmc.net/net/fabricmc/fabric-loader/maven-metadata.xml")
+          loader = re.search(r"<release>([^<]+)</release>", loader_meta).group(1)
+
+          modmenu = ""
+          try:
+              mm = get("https://maven.terraformersmc.com/releases/com/terraformersmc/modmenu/maven-metadata.xml")
+              modmenu = re.search(r"<release>([^<]+)</release>", mm).group(1)
+          except Exception as e:
+              print("Mod Menu no disponible, se compila sin pantalla de ajustes: " + str(e))
+
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("FABRIC_API=" + fabric_api + "\n")
+              f.write("LOADER=" + loader + "\n")
+              f.write("MODMENU=" + modmenu + "\n")
+
+          print("Fabric API", fabric_api, "| Loader", loader, "| Mod Menu", modmenu or "(ninguno)")
+          PY
+
+      - name: Compilar
+        if: steps.zip.outputs.found == 'true'
+        working-directory: proyecto
+        run: |
+          set -o pipefail
+          gradle build --no-daemon --console=plain \
+            -Ploader_version="$LOADER" \
+            -Pfabric_api_version="$FABRIC_API" \
+            -Pmodmenu_version="$MODMENU" 2>&1 | tee ../build.log
+
+      - name: Mostrar errores
+        if: failure()
+        run: |
+          {
+            echo "### Errores de compilacion"
+            echo '```'
+            if [ -f build.log ]; then grep -E -A3 "error:|What went wrong|Could not (resolve|find)" build.log | head -n 80; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar el .jar
+        if: steps.zip.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          JAR=$(ls proyecto/build/libs/*.jar | grep -v -- '-sources' | grep -v -- '-dev' | head -n 1)
+          echo "Jar: $JAR"
+          gh release create "impactframes-build${{ github.run_number }}" "$JAR" \
+            --title "Impact Frames (build ${{ github.run_number }})" \
+            --notes "Mod Impact Frames para Fabric 26.3. Descarga el .jar y ponlo en la carpeta mods."
+            
